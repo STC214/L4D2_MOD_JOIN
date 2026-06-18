@@ -74,3 +74,32 @@ func TestGroupedSelectionAppliesToEveryPath(t *testing.T) {
 		t.Fatalf("group selection was not applied to all paths: %#v", loaded)
 	}
 }
+
+func TestRemoveLegacyOutputJSONOnlyDeletesMatchingToolState(t *testing.T) {
+	output := t.TempDir()
+	stateDir := t.TempDir()
+	matching := conflictPolicy{Fingerprint: "same"}
+	if err := writeJSONAtomic(filepath.Join(output, conflictPolicyName), matching); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(stateDir, conflictPolicyName), matching); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := []byte(`{"user":"keep me"}`)
+	if err := os.WriteFile(filepath.Join(output, scanReportName), unrelated, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(filepath.Join(stateDir, scanReportName), modscan.Result{Fingerprint: "current"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeLegacyOutputJSON(output, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(output, conflictPolicyName)); !os.IsNotExist(err) {
+		t.Fatal("matching tool JSON was not removed")
+	}
+	data, err := os.ReadFile(filepath.Join(output, scanReportName))
+	if err != nil || string(data) != string(unrelated) {
+		t.Fatal("unrelated same-name JSON was removed or changed")
+	}
+}

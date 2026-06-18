@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	scanReportName     = "mod-scan-report.json"
 	conflictPolicyName = "mod-conflict-policy.json"
 	buildManifestName  = "l4d2modjoin-build.json"
 )
@@ -54,6 +55,7 @@ type buildManifest struct {
 	Files          []builtFile     `json:"files"`
 	Packages       []string        `json:"packages"`
 	SourcePackages []sourcePackage `json:"source_packages"`
+	DeployedAddons string          `json:"deployed_addons,omitempty"`
 }
 
 func writeConflictPolicy(output string, result modscan.Result) error {
@@ -177,7 +179,7 @@ func loadConflictSelections(output, fingerprint string) (map[string]string, erro
 	return selections, nil
 }
 
-func createBuildManifest(plan vpkmerge.Plan, scanResult modscan.Result, policyDigest string) (buildManifest, error) {
+func createBuildManifest(plan vpkmerge.Plan, scanResult modscan.Result, policyDigest, stateDir string) (buildManifest, error) {
 	manifest := buildManifest{
 		Version: 2, BuiltAt: time.Now(), Source: cleanPath(plan.Input),
 		Fingerprint: scanResult.Fingerprint, PolicySHA256: policyDigest,
@@ -227,7 +229,7 @@ func createBuildManifest(plan vpkmerge.Plan, scanResult modscan.Result, policyDi
 	if err := archiveStaleBuildOutputs(plan); err != nil {
 		return buildManifest{}, err
 	}
-	if err := writeJSONAtomic(filepath.Join(plan.Output, buildManifestName), manifest); err != nil {
+	if err := writeJSONAtomic(filepath.Join(stateDir, buildManifestName), manifest); err != nil {
 		return buildManifest{}, err
 	}
 	return manifest, nil
@@ -274,11 +276,15 @@ func archiveStaleBuildOutputs(plan vpkmerge.Plan) error {
 	return nil
 }
 
-func validateBuild(output string, result *modscan.Result) (buildManifest, error) {
+func validateBuild(output, stateDir string, result *modscan.Result) (buildManifest, error) {
+	return validateBuildProgress(output, stateDir, result, nil)
+}
+
+func validateBuildProgress(output, stateDir string, result *modscan.Result, progress operationProgress) (buildManifest, error) {
 	if result == nil {
 		return buildManifest{}, fmt.Errorf("请先完成智能扫描")
 	}
-	data, err := os.ReadFile(filepath.Join(output, buildManifestName))
+	data, err := os.ReadFile(filepath.Join(stateDir, buildManifestName))
 	if err != nil {
 		return buildManifest{}, fmt.Errorf("没有找到成功构建清单，请先合并")
 	}
@@ -289,7 +295,7 @@ func validateBuild(output string, result *modscan.Result) (buildManifest, error)
 	if manifest.Fingerprint != result.Fingerprint || cleanPath(manifest.Source) != cleanPath(result.Directory) {
 		return buildManifest{}, fmt.Errorf("构建产物与当前扫描结果不一致，请重新合并")
 	}
-	policyDigest, err := hashFile(filepath.Join(output, conflictPolicyName))
+	policyDigest, err := hashFile(filepath.Join(stateDir, conflictPolicyName))
 	if err != nil || policyDigest != manifest.PolicySHA256 {
 		return buildManifest{}, fmt.Errorf("冲突策略在构建后发生变化，请重新合并")
 	}
@@ -297,18 +303,104 @@ func validateBuild(output string, result *modscan.Result) (buildManifest, error)
 	if err != nil || current != result.Fingerprint {
 		return buildManifest{}, fmt.Errorf("源 MOD 在扫描后发生变化，请重新扫描并合并")
 	}
+	var totalBytes int64
 	for _, file := range manifest.Files {
+		totalBytes += file.Size
+	}
+	var completed int64
+	lastPercent := int64(-1)
+	reportBytes := func(done int64) {
+		percent := int64(100)
+		if totalBytes > 0 {
+			percent = done * 100 / totalBytes
+		}
+		if percent == lastPercent {
+			return
+		}
+		lastPercent = percent
+		reportProgress(progress, done, totalBytes, "")
+	}
+	reportProgress(progress, 0, totalBytes, "部署 · 正在校验构建产物……")
+	for index, file := range manifest.Files {
 		path := filepath.Join(output, file.Name)
 		stat, statErr := os.Stat(path)
 		if statErr != nil || stat.Size() != file.Size {
 			return buildManifest{}, fmt.Errorf("输出文件缺失或大小改变: %s", file.Name)
 		}
-		digest, hashErr := hashFile(path)
+		reportProgress(progress, completed, totalBytes,
+			fmt.Sprintf("部署 · 预检 [%d/%d] %s", index+1, len(manifest.Files), file.Name))
+		digest, hashErr := hashFileProgress(path, func(done int64) {
+			reportBytes(completed + done)
+		})
 		if hashErr != nil || digest != file.SHA256 {
 			return buildManifest{}, fmt.Errorf("输出文件校验失败: %s", file.Name)
 		}
+		completed += file.Size
 	}
+	reportProgress(progress, totalBytes, totalBytes, "部署 · 构建产物校验通过")
 	return manifest, nil
+}
+
+func removeLegacyOutputJSON(output, stateDir string) error {
+	if cleanPath(output) == cleanPath(stateDir) {
+		return nil
+	}
+	var failures []string
+	for _, name := range []string{scanReportName, conflictPolicyName, buildManifestName} {
+		legacyPath := filepath.Join(output, name)
+		statePath := filepath.Join(stateDir, name)
+		matches, err := matchingToolJSON(legacyPath, statePath, name)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if !matches {
+			continue
+		}
+		if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+			failures = append(failures, fmt.Sprintf("清理旧状态文件 %s: %v", legacyPath, err))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func matchingToolJSON(legacyPath, statePath, name string) (bool, error) {
+	legacyData, err := os.ReadFile(legacyPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("读取旧状态文件 %s: %w", legacyPath, err)
+	}
+	stateData, err := os.ReadFile(statePath)
+	if err != nil {
+		return false, nil
+	}
+	switch name {
+	case scanReportName:
+		var legacy, current modscan.Result
+		if json.Unmarshal(legacyData, &legacy) != nil || json.Unmarshal(stateData, &current) != nil {
+			return false, nil
+		}
+		return legacy.Fingerprint != "" && legacy.Fingerprint == current.Fingerprint, nil
+	case conflictPolicyName:
+		var legacy, current conflictPolicy
+		if json.Unmarshal(legacyData, &legacy) != nil || json.Unmarshal(stateData, &current) != nil {
+			return false, nil
+		}
+		return legacy.Fingerprint != "" && legacy.Fingerprint == current.Fingerprint, nil
+	case buildManifestName:
+		var legacy, current buildManifest
+		if json.Unmarshal(legacyData, &legacy) != nil || json.Unmarshal(stateData, &current) != nil {
+			return false, nil
+		}
+		return legacy.Version > 0 && legacy.Fingerprint != "" &&
+			legacy.Fingerprint == current.Fingerprint && cleanPath(legacy.Source) == cleanPath(current.Source), nil
+	}
+	return false, nil
 }
 
 func hashFile(path string) (string, error) {

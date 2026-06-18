@@ -154,7 +154,7 @@ type browseInfo struct {
 }
 type appEvent struct {
 	Kind, Text     string
-	Current, Total int
+	Current, Total int64
 	Data           any
 }
 
@@ -163,6 +163,7 @@ type uiState struct {
 	scan, merge, deploy, restore                uintptr
 	font, titleFont                             uintptr
 	bgBrush, fieldBrush                         uintptr
+	stateDir                                    string
 	scanResult                                  *modscan.Result
 	busy                                        bool
 }
@@ -288,10 +289,15 @@ func createUI(hwnd uintptr) {
 	base := cwd
 	if executable, err := os.Executable(); err == nil {
 		executableDir := filepath.Dir(executable)
+		ui.stateDir = executableDir
 		if info, statErr := os.Stat(filepath.Join(executableDir, "workshop")); statErr == nil && info.IsDir() {
 			base = executableDir
 		}
 	}
+	if ui.stateDir == "" {
+		ui.stateDir = cwd
+	}
+	deploymentMigrated, deploymentMigrationErr := migrateDeploymentRegistry(ui.stateDir)
 	source := filepath.Join(base, "workshop")
 	output := filepath.Join(base, "merged")
 	addons := detectAddonsDir()
@@ -320,6 +326,12 @@ func createUI(hwnd uintptr) {
 		logLine("未自动找到游戏目录，请手动选择 left4dead2\\addons。")
 	} else {
 		logLine("已找到游戏目录：" + addons)
+	}
+	logLine("JSON 状态目录：" + ui.stateDir)
+	if deploymentMigrationErr != nil {
+		logLine("部署记录迁移失败：" + deploymentMigrationErr.Error())
+	} else if deploymentMigrated {
+		logLine("旧版部署记录已升级为多目录格式。")
 	}
 }
 
@@ -359,7 +371,7 @@ func handleCommand(id int) {
 			logLine("请先点击“智能扫描 MOD”，生成当前目录的动态分类方案。")
 			return
 		}
-		groups, existing, err := unresolvedConflictGroups(getText(ui.output), *ui.scanResult)
+		groups, existing, err := unresolvedConflictGroups(ui.stateDir, *ui.scanResult)
 		if err != nil {
 			logLine("无法读取冲突策略：" + err.Error())
 			return
@@ -367,7 +379,7 @@ func handleCommand(id int) {
 		if len(groups) == 0 {
 			startTask("merge")
 		} else {
-			openConflictResolver(groups, existing, *ui.scanResult, getText(ui.output))
+			openConflictResolver(groups, existing, *ui.scanResult, ui.stateDir)
 		}
 	case idDeploy:
 		startTask("deploy")
@@ -382,6 +394,7 @@ func startTask(kind string) {
 	}
 	ui.busy = true
 	setButtons(false)
+	procSendMessage.Call(ui.progress, pbmSetPos, 0, 0)
 	source, output, addons := getText(ui.source), getText(ui.output), getText(ui.addons)
 	scanResult := ui.scanResult
 	go func() {
@@ -401,12 +414,20 @@ func startTask(kind string) {
 			if err != nil {
 				postEvent(appEvent{Kind: "error", Text: "扫描失败：" + err.Error()})
 			} else {
-				if mkdirErr := os.MkdirAll(output, 0755); mkdirErr == nil {
-					_ = writeJSONAtomic(filepath.Join(output, "mod-scan-report.json"), result)
-					if policyErr := writeConflictPolicy(output, result); policyErr != nil {
-						postEvent(appEvent{Kind: "error", Text: "无法写入冲突策略：" + policyErr.Error()})
-						break
-					}
+				if mkdirErr := os.MkdirAll(ui.stateDir, 0755); mkdirErr != nil {
+					postEvent(appEvent{Kind: "error", Text: "无法创建 EXE 同级状态目录：" + mkdirErr.Error()})
+					break
+				}
+				if reportErr := writeJSONAtomic(filepath.Join(ui.stateDir, scanReportName), result); reportErr != nil {
+					postEvent(appEvent{Kind: "error", Text: "无法写入扫描报告：" + reportErr.Error()})
+					break
+				}
+				if policyErr := writeConflictPolicy(ui.stateDir, result); policyErr != nil {
+					postEvent(appEvent{Kind: "error", Text: "无法写入冲突策略：" + policyErr.Error()})
+					break
+				}
+				if cleanupErr := removeLegacyOutputJSON(output, ui.stateDir); cleanupErr != nil {
+					postEvent(appEvent{Kind: "log", Text: "旧 JSON 保留未删除：" + cleanupErr.Error()})
 				}
 				postEvent(appEvent{Kind: "scan", Data: result})
 			}
@@ -428,7 +449,7 @@ func startTask(kind string) {
 				postEvent(appEvent{Kind: "error", Text: "源 MOD 在扫描后发生变化，请重新扫描"})
 				break
 			}
-			selections, selectionErr := loadConflictSelections(output, scanResult.Fingerprint)
+			selections, selectionErr := loadConflictSelections(ui.stateDir, scanResult.Fingerprint)
 			if selectionErr != nil {
 				postEvent(appEvent{Kind: "error", Text: selectionErr.Error()})
 				break
@@ -439,7 +460,7 @@ func startTask(kind string) {
 				break
 			}
 			// Any new build attempt invalidates the previous deployable state.
-			_ = os.Remove(filepath.Join(output, buildManifestName))
+			_ = os.Remove(filepath.Join(ui.stateDir, buildManifestName))
 			cleanup, err := prepareOverlays(&plan, scanResult)
 			if cleanup != nil {
 				defer cleanup()
@@ -447,19 +468,22 @@ func startTask(kind string) {
 			if err == nil {
 				postEvent(appEvent{Kind: "log", Text: "开始分类合并……"})
 				err = vpkmerge.Run(plan, func(progress vpkmerge.Progress) {
-					postEvent(appEvent{Kind: "progress", Current: progress.GroupIndex, Total: progress.GroupCount,
+					postEvent(appEvent{Kind: "progress", Current: int64(progress.GroupIndex), Total: int64(progress.GroupCount),
 						Text: fmt.Sprintf("[%d/%d] %s · %d 文件 · %.1f MiB", progress.GroupIndex, progress.GroupCount, progress.Output, progress.FileCount, float64(progress.Bytes)/1048576)})
 				})
 			}
 			if err != nil {
 				postEvent(appEvent{Kind: "error", Text: "合并失败：" + err.Error()})
 			} else {
-				policyDigest, digestErr := hashFile(filepath.Join(output, conflictPolicyName))
+				policyDigest, digestErr := hashFile(filepath.Join(ui.stateDir, conflictPolicyName))
 				if digestErr != nil {
 					postEvent(appEvent{Kind: "error", Text: "冲突策略校验失败：" + digestErr.Error()})
-				} else if _, manifestErr := createBuildManifest(plan, *scanResult, policyDigest); manifestErr != nil {
+				} else if _, manifestErr := createBuildManifest(plan, *scanResult, policyDigest, ui.stateDir); manifestErr != nil {
 					postEvent(appEvent{Kind: "error", Text: "构建清单生成失败：" + manifestErr.Error()})
 				} else {
+					if cleanupErr := removeLegacyOutputJSON(output, ui.stateDir); cleanupErr != nil {
+						postEvent(appEvent{Kind: "log", Text: "旧 JSON 保留未删除：" + cleanupErr.Error()})
+					}
 					postEvent(appEvent{Kind: "log", Text: "全部分类包合并完成，并已生成校验清单。"})
 				}
 			}
@@ -476,12 +500,26 @@ func startTask(kind string) {
 				postEvent(appEvent{Kind: "error", Text: "部署已阻止：来源目录与扫描结果不一致，请重新扫描"})
 				break
 			}
-			manifest, validateErr := validateBuild(output, scanResult)
+			manifest, validateErr := validateBuildProgress(output, ui.stateDir, scanResult, func(current, total int64, text string) {
+				// Build validation occupies the first 20% of deployment.
+				scaled := int64(0)
+				if total > 0 {
+					scaled = current * 20 / total
+				}
+				postEvent(appEvent{Kind: "progress", Current: scaled, Total: 100, Text: text})
+			})
 			if validateErr != nil {
 				postEvent(appEvent{Kind: "error", Text: "部署已阻止：" + validateErr.Error()})
 				break
 			}
-			backup, localDuplicates, err := deployAndDisable(manifest, output, addons)
+			backup, localDuplicates, err := deployAndDisable(manifest, output, addons, ui.stateDir, func(current, total int64, text string) {
+				// Staging, duplicate detection and commit occupy the final 80%.
+				scaled := int64(20)
+				if total > 0 {
+					scaled += current * 80 / total
+				}
+				postEvent(appEvent{Kind: "progress", Current: scaled, Total: 100, Text: text})
+			})
 			if err != nil {
 				postEvent(appEvent{Kind: "error", Text: "部署失败：" + err.Error()})
 			} else {
@@ -498,7 +536,9 @@ func startTask(kind string) {
 				postEvent(appEvent{Kind: "error", Text: "还原已阻止：请先完全退出 Left 4 Dead 2"})
 				break
 			}
-			backup, err := restoreLatest(addons)
+			backup, err := restoreLatest(addons, ui.stateDir, func(current, total int64, text string) {
+				postEvent(appEvent{Kind: "progress", Current: current, Total: total, Text: text})
+			})
 			if err != nil {
 				postEvent(appEvent{Kind: "error", Text: "恢复失败：" + err.Error()})
 			} else {
@@ -628,12 +668,14 @@ func handleEvent(id uint64) {
 	event := value.(appEvent)
 	switch event.Kind {
 	case "progress":
-		position := 0
+		position := int64(0)
 		if event.Total > 0 {
 			position = event.Current * 100 / event.Total
 		}
 		procSendMessage.Call(ui.progress, pbmSetPos, uintptr(position), 0)
-		logLine(event.Text)
+		if event.Text != "" {
+			logLine(event.Text)
+		}
 	case "error":
 		logLine("错误 · " + event.Text)
 	case "log":
@@ -658,7 +700,7 @@ func handleEvent(id uint64) {
 		logLine(fmt.Sprintf("智能扫描完成：%d 个 MOD，%d 个分类；%d 个同内容重复，%d 个不同内容冲突。",
 			len(result.Packages), len(result.Categories), identical, different))
 		if different > 0 {
-			logLine("冲突策略：" + filepath.Join(getText(ui.output), conflictPolicyName) +
+			logLine("冲突策略：" + filepath.Join(ui.stateDir, conflictPolicyName) +
 				"；请为非安全冲突填写 selected 后再合并。")
 		}
 		for _, category := range result.Categories {

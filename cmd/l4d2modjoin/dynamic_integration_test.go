@@ -20,6 +20,7 @@ func TestDynamicMergeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := filepath.Join(t.TempDir(), "merged")
+	stateDir := t.TempDir()
 	selections := map[string]string{}
 	for _, conflict := range result.Conflicts {
 		if !conflict.Identical && !conflict.SafeMerge {
@@ -38,7 +39,7 @@ func TestDynamicMergeIntegration(t *testing.T) {
 	if err := vpkmerge.Run(plan, nil); err != nil {
 		t.Fatal(err)
 	}
-	policyPath := filepath.Join(output, conflictPolicyName)
+	policyPath := filepath.Join(stateDir, conflictPolicyName)
 	if err := os.WriteFile(policyPath, []byte("{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,7 @@ func TestDynamicMergeIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := createBuildManifest(plan, result, policyDigest); err != nil {
+	if _, err := createBuildManifest(plan, result, policyDigest, stateDir); err != nil {
 		t.Fatal(err)
 	}
 	owners := map[string]string{}
@@ -110,6 +111,7 @@ func TestDeployDisablesRenamedLocalDuplicateMod(t *testing.T) {
 	root := t.TempDir()
 	addons := filepath.Join(root, "left4dead2", "addons")
 	output := filepath.Join(root, "merged")
+	stateDir := filepath.Join(root, "app")
 	if err := os.MkdirAll(addons, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +144,7 @@ func TestDeployDisablesRenamedLocalDuplicateMod(t *testing.T) {
 	if err := os.WriteFile(addonList, []byte(input), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, duplicates, err := deployAndDisable(manifest, output, addons)
+	_, duplicates, err := deployAndDisable(manifest, output, addons, stateDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
