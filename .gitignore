@@ -1,0 +1,49 @@
+# Local MOD inputs and generated VPK outputs
+/workshop/
+/merged/
+
+# Build outputs and temporary workspaces
+/dist/
+/.tmp/
+*.exe
+*.test
+*.out
+
+# Generated Windows resources and icon derivatives
+/assets/app.ico
+/assets/app-icon.png
+/cmd/l4d2modjoin/rsrc_windows_*.syso
+
+# Generated scan, audit, policy and build reports
+/audit-report.json
+/merged-audit-report.json
+/mod-scan-report.json
+/mod-conflict-policy.json
+/l4d2modjoin-build.json
+/.l4d2modjoin-deployment.json
+
+# Runtime leftovers, backups and logs
+*.tmp
+*.bak
+*.log
+*.replace-backup
+
+# Test and coverage artifacts
+/coverage/
+coverage.out
+*.coverprofile
+
+# Editors and operating-system metadata
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment files
+.env
+.env.*
+!.env.example
