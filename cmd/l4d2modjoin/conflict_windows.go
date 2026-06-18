@@ -18,6 +18,7 @@ const (
 	idConflictConfirm   = 2104
 	idConflictCancel    = 2105
 	lbnSelChange        = 1
+	lbsNotify           = 0x0001
 	cbnSelChange        = 1
 	cbAddString         = 0x0143
 	cbGetCurSel         = 0x0147
@@ -145,7 +146,8 @@ func createConflictUI(hwnd uintptr) {
 	makeLabel(hwnd, "以下冲突已按竞争 MOD 聚合。每组选择一次，会应用到该组全部冲突文件。", 30, 96, 790, 26)
 	makeLabel(hwnd, "左侧选择冲突组，右侧选择要保留的 MOD。程序已预选推荐项，可一次确认。", 30, 124, 790, 24)
 	resolver.list = makeControl(hwnd, "LISTBOX", "",
-		wsChild|wsVisible|wsBorder|wsVScroll|lbsNoIntegral, 30, 158, 330, 320, idConflictList)
+		wsChild|wsVisible|wsBorder|wsVScroll|wsTabStop|lbsNotify|lbsNoIntegral,
+		30, 158, 330, 320, idConflictList)
 	resolver.detail = makeControl(hwnd, "STATIC", "",
 		wsChild|wsVisible|ssLeft, 390, 162, 420, 160, 0)
 	makeLabel(hwnd, "保留此 MOD 的冲突版本：", 390, 338, 300, 24)
