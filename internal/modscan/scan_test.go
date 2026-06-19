@@ -82,3 +82,44 @@ func TestMiscPackagesStayInOneOutputGroup(t *testing.T) {
 		t.Fatalf("misc packages were not kept in one output: %#v", plan.Groups)
 	}
 }
+
+func TestMaterialOnlyCompanionFollowsUniqueNamespaceCategory(t *testing.T) {
+	packages := []vpkmerge.PackageInfo{
+		{Path: "weapon.vpk", Files: []vpkmerge.FileInfo{
+			{Path: "models/v_models/v_rifle.mdl"},
+			{Path: "materials/mw2019/weapons/rifle.vtf"},
+		}},
+		{Path: "screen-patch.vpk", Files: []vpkmerge.FileInfo{
+			{Path: "materials/mw2019/screen/display.vmt"},
+			{Path: "materials/mw2019/screen/display.vtf"},
+		}},
+	}
+	categories := map[string]string{"weapon.vpk": "weapons", "screen-patch.vpk": "misc"}
+	inferred := refineMaterialCompanions(packages, categories)
+	if categories["screen-patch.vpk"] != "weapons" || len(inferred) != 1 {
+		t.Fatalf("material companion was not assigned to weapons: %#v %#v", categories, inferred)
+	}
+}
+
+func TestMaterialOnlyCompanionStaysMiscForAmbiguousOrGenericNamespace(t *testing.T) {
+	packages := []vpkmerge.PackageInfo{
+		{Path: "weapon.vpk", Files: []vpkmerge.FileInfo{
+			{Path: "models/v_models/v_rifle.mdl"},
+			{Path: "materials/shared/rifle.vtf"},
+			{Path: "materials/models/weapons/rifle.vtf"},
+		}},
+		{Path: "survivor.vpk", Files: []vpkmerge.FileInfo{
+			{Path: "models/survivors/survivor_test.mdl"},
+			{Path: "materials/shared/survivor.vtf"},
+		}},
+		{Path: "ambiguous.vpk", Files: []vpkmerge.FileInfo{{Path: "materials/shared/patch.vtf"}}},
+		{Path: "generic.vpk", Files: []vpkmerge.FileInfo{{Path: "materials/models/patch.vtf"}}},
+	}
+	categories := map[string]string{
+		"weapon.vpk": "weapons", "survivor.vpk": "survivors",
+		"ambiguous.vpk": "misc", "generic.vpk": "misc",
+	}
+	if inferred := refineMaterialCompanions(packages, categories); len(inferred) != 0 {
+		t.Fatalf("ambiguous/generic companions should remain misc: %#v", inferred)
+	}
+}

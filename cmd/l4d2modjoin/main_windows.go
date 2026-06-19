@@ -58,7 +58,10 @@ const (
 	idBrowseOut      = 1012
 	idBrowseGame     = 1013
 	idSourceEdit     = 1021
+	idOutputEdit     = 1022
+	idAddonsEdit     = 1023
 	enChange         = 0x0300
+	enKillFocus      = 0x0200
 )
 
 var (
@@ -236,6 +239,11 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		if id == idSourceEdit && code == enChange {
 			ui.scanResult = nil
 		}
+		if isDirectoryEdit(id) && code == enKillFocus {
+			if err := saveCurrentDirectorySettings(); err != nil {
+				logLine("保存目录设置失败：" + err.Error())
+			}
+		}
 		if id != 0 {
 			handleCommand(id)
 		}
@@ -262,6 +270,9 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			logLine("任务仍在运行，请等待完成后关闭。")
 			return 0
 		}
+		if err := saveCurrentDirectorySettings(); err != nil {
+			logLine("保存目录设置失败：" + err.Error())
+		}
 	case wmDestroy:
 		if ui.font != 0 {
 			procDeleteObject.Call(ui.font)
@@ -287,20 +298,38 @@ func createUI(hwnd uintptr) {
 	ui.fieldBrush, _, _ = procCreateBrush.Call(0x00352E2A)
 	cwd, _ := os.Getwd()
 	base := cwd
+	stateRoot := cwd
 	if executable, err := os.Executable(); err == nil {
 		executableDir := filepath.Dir(executable)
-		ui.stateDir = executableDir
+		stateRoot = executableDir
 		if info, statErr := os.Stat(filepath.Join(executableDir, "workshop")); statErr == nil && info.IsDir() {
 			base = executableDir
 		}
 	}
-	if ui.stateDir == "" {
-		ui.stateDir = cwd
-	}
+	ui.stateDir = filepath.Join(stateRoot, stateDirectoryName)
+	stateFilesMigrated, stateFilesMigrationErr := migrateRootStateFiles(stateRoot, ui.stateDir)
 	deploymentMigrated, deploymentMigrationErr := migrateDeploymentRegistry(ui.stateDir)
-	source := filepath.Join(base, "workshop")
-	output := filepath.Join(base, "merged")
 	addons := detectAddonsDir()
+	source := filepath.Join(base, "workshop")
+	if addons != "" {
+		subscriptions := filepath.Join(addons, "workshop")
+		if info, err := os.Stat(subscriptions); err == nil && info.IsDir() {
+			source = subscriptions
+		}
+	}
+	output := filepath.Join(base, "merged")
+	settings, settingsErr := loadAppSettings(ui.stateDir)
+	if settingsErr == nil {
+		if settings.Source != "" {
+			source = settings.Source
+		}
+		if settings.Output != "" {
+			output = settings.Output
+		}
+		if settings.Addons != "" {
+			addons = settings.Addons
+		}
+	}
 	ui.font, _, _ = procCreateFont.Call(19, 0, 0, 0, 400, 0, 0, 0, 134, 0, 0, 5, 0, uintptr(unsafe.Pointer(utf16("Segoe UI"))))
 	ui.titleFont, _, _ = procCreateFont.Call(34, 0, 0, 0, 600, 0, 0, 0, 134, 0, 0, 5, 0, uintptr(unsafe.Pointer(utf16("Segoe UI"))))
 
@@ -308,10 +337,10 @@ func createUI(hwnd uintptr) {
 	ui.source = makeControl(hwnd, "EDIT", source, wsChild|wsVisible|wsBorder|esAutoHScroll|wsTabStop, 42, 145, 790, 34, idSourceEdit)
 	makeButton(hwnd, "浏览", 844, 145, 88, 34, idBrowseSrc)
 	makeLabel(hwnd, "合并输出目录", 42, 193, 160, 24)
-	ui.output = makeControl(hwnd, "EDIT", output, wsChild|wsVisible|wsBorder|esAutoHScroll|wsTabStop, 42, 220, 790, 34, 0)
+	ui.output = makeControl(hwnd, "EDIT", output, wsChild|wsVisible|wsBorder|esAutoHScroll|wsTabStop, 42, 220, 790, 34, idOutputEdit)
 	makeButton(hwnd, "浏览", 844, 220, 88, 34, idBrowseOut)
 	makeLabel(hwnd, "游戏 Addons 目录", 42, 268, 180, 24)
-	ui.addons = makeControl(hwnd, "EDIT", addons, wsChild|wsVisible|wsBorder|esAutoHScroll|wsTabStop, 42, 295, 790, 34, 0)
+	ui.addons = makeControl(hwnd, "EDIT", addons, wsChild|wsVisible|wsBorder|esAutoHScroll|wsTabStop, 42, 295, 790, 34, idAddonsEdit)
 	makeButton(hwnd, "浏览", 844, 295, 88, 34, idBrowseGame)
 
 	ui.scan = makeButton(hwnd, "智能扫描 MOD", 42, 355, 150, 44, idScan)
@@ -328,10 +357,23 @@ func createUI(hwnd uintptr) {
 		logLine("已找到游戏目录：" + addons)
 	}
 	logLine("JSON 状态目录：" + ui.stateDir)
+	if stateFilesMigrationErr != nil {
+		logLine("顶级 JSON 迁移未完全完成：" + stateFilesMigrationErr.Error())
+	} else if stateFilesMigrated > 0 {
+		logLine(fmt.Sprintf("已将 %d 个顶级 JSON 迁移到 data 目录。", stateFilesMigrated))
+	}
+	if settingsErr != nil {
+		logLine("目录设置读取失败，已使用自动检测值：" + settingsErr.Error())
+	} else if settings.Source != "" || settings.Output != "" || settings.Addons != "" {
+		logLine("已加载上次保存的目录设置。")
+	}
 	if deploymentMigrationErr != nil {
 		logLine("部署记录迁移失败：" + deploymentMigrationErr.Error())
 	} else if deploymentMigrated {
 		logLine("旧版部署记录已升级为多目录格式。")
+	}
+	if err := saveCurrentDirectorySettings(); err != nil {
+		logLine("保存目录设置失败：" + err.Error())
 	}
 }
 
@@ -355,14 +397,17 @@ func handleCommand(id int) {
 	case idBrowseSrc:
 		if path := browseFolder(ui.hwnd, "选择包含 VPK 的 MOD 目录"); path != "" {
 			setText(ui.source, path)
+			saveDirectorySettingsWithLog()
 		}
 	case idBrowseOut:
 		if path := browseFolder(ui.hwnd, "选择合并包输出目录"); path != "" {
 			setText(ui.output, path)
+			saveDirectorySettingsWithLog()
 		}
 	case idBrowseGame:
 		if path := browseFolder(ui.hwnd, "选择 left4dead2\\addons 目录"); path != "" {
 			setText(ui.addons, path)
+			saveDirectorySettingsWithLog()
 		}
 	case idScan:
 		startTask("scan")
@@ -391,6 +436,9 @@ func handleCommand(id int) {
 func startTask(kind string) {
 	if ui.busy {
 		return
+	}
+	if err := saveCurrentDirectorySettings(); err != nil {
+		logLine("保存目录设置失败：" + err.Error())
 	}
 	ui.busy = true
 	setButtons(false)
@@ -548,6 +596,32 @@ func startTask(kind string) {
 	}()
 }
 
+func isDirectoryEdit(id int) bool {
+	return id == idSourceEdit || id == idOutputEdit || id == idAddonsEdit
+}
+
+func currentDirectorySettings() appSettings {
+	return appSettings{
+		Version: 1,
+		Source:  getText(ui.source),
+		Output:  getText(ui.output),
+		Addons:  getText(ui.addons),
+	}
+}
+
+func saveCurrentDirectorySettings() error {
+	if ui.stateDir == "" || ui.source == 0 || ui.output == 0 || ui.addons == 0 {
+		return nil
+	}
+	return saveAppSettings(ui.stateDir, currentDirectorySettings())
+}
+
+func saveDirectorySettingsWithLog() {
+	if err := saveCurrentDirectorySettings(); err != nil {
+		logLine("保存目录设置失败：" + err.Error())
+	}
+}
+
 func prepareOverlays(plan *vpkmerge.Plan, scanResult *modscan.Result) (func(), error) {
 	dir, err := os.MkdirTemp("", "l4d2modjoin-overlays-")
 	if err != nil {
@@ -699,6 +773,22 @@ func handleEvent(id uint64) {
 		}
 		logLine(fmt.Sprintf("智能扫描完成：%d 个 MOD，%d 个分类；%d 个同内容重复，%d 个不同内容冲突。",
 			len(result.Packages), len(result.Categories), identical, different))
+		if registry, err := loadDeploymentRegistry(ui.stateDir); err == nil {
+			if deployment, found := registryDeployment(registry, getText(ui.addons)); found &&
+				cleanPath(deployment.Source) == cleanPath(result.Directory) {
+				added, removed := subscriptionChanges(result, deployment)
+				if len(added) > 0 || len(removed) > 0 {
+					logLine(fmt.Sprintf("订阅集合已变化：新增 %d 个，移除 %d 个；需要重新合并并部署。",
+						len(added), len(removed)))
+					if len(added) > 0 {
+						logLine("新增订阅：" + strings.Join(added, ", "))
+					}
+					if len(removed) > 0 {
+						logLine("已移除订阅：" + strings.Join(removed, ", "))
+					}
+				}
+			}
+		}
 		if different > 0 {
 			logLine("冲突策略：" + filepath.Join(ui.stateDir, conflictPolicyName) +
 				"；请为非安全冲突填写 selected 后再合并。")
@@ -706,6 +796,10 @@ func handleEvent(id uint64) {
 		for _, category := range result.Categories {
 			logLine(fmt.Sprintf("分类 · %s：%d 个 MOD → %s",
 				category.Title, len(category.Packages), category.Output))
+		}
+		for _, inferred := range result.InferredPackages {
+			logLine(fmt.Sprintf("配套包归类 · %s → %s · %s",
+				inferred.Name, inferred.Category, inferred.Reason))
 		}
 		if len(result.UnknownPackages) > 0 {
 			logLine("未明确识别的 MOD 已放入 Misc：" + strings.Join(result.UnknownPackages, ", "))

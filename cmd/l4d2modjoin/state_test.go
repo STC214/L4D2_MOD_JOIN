@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"l4d2-mod-join/internal/modscan"
+	"l4d2-mod-join/internal/vpkmerge"
 )
 
 func TestConflictPolicyBlocksUnresolvedChoices(t *testing.T) {
@@ -101,5 +102,109 @@ func TestRemoveLegacyOutputJSONOnlyDeletesMatchingToolState(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(output, scanReportName))
 	if err != nil || string(data) != string(unrelated) {
 		t.Fatal("unrelated same-name JSON was removed or changed")
+	}
+}
+
+func TestSubscriptionChangesUsesSourcePackages(t *testing.T) {
+	result := modscan.Result{Packages: []vpkmerge.PackageInfo{
+		{Path: `mods\a.vpk`}, {Path: `mods\new.vpk`},
+	}}
+	deployment := buildManifest{
+		Packages: []string{"a.vpk", "local-duplicate.vpk"},
+		SourcePackages: []sourcePackage{
+			{Name: "a.vpk"}, {Name: "removed.vpk"},
+		},
+	}
+	added, removed := subscriptionChanges(result, deployment)
+	if len(added) != 1 || added[0] != "new.vpk" ||
+		len(removed) != 1 || removed[0] != "removed.vpk" {
+		t.Fatalf("unexpected subscription changes: added=%#v removed=%#v", added, removed)
+	}
+}
+
+func TestAppSettingsRoundTrip(t *testing.T) {
+	stateDir := t.TempDir()
+	expected := appSettings{
+		Source: `E:\SteamLibrary\steamapps\common\Left 4 Dead 2\left4dead2\addons\workshop`,
+		Output: `D:\L4D2\merged`,
+		Addons: `E:\SteamLibrary\steamapps\common\Left 4 Dead 2\left4dead2\addons`,
+	}
+	if err := saveAppSettings(stateDir, expected); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := loadAppSettings(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.Version != 1 || actual.Source != expected.Source ||
+		actual.Output != expected.Output || actual.Addons != expected.Addons {
+		t.Fatalf("settings did not round trip: %#v", actual)
+	}
+}
+
+func TestLoadAppSettingsRejectsCorruptOrUnknownVersion(t *testing.T) {
+	for name, content := range map[string]string{
+		"corrupt": `{broken`,
+		"version": `{"version":99}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(stateDir, settingsName), []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAppSettings(stateDir); err == nil {
+				t.Fatal("invalid settings should be rejected")
+			}
+		})
+	}
+}
+
+func TestMigrateRootStateFiles(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, stateDirectoryName)
+	for _, name := range []string{scanReportName, settingsName, deploymentManifestName} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count, err := migrateRootStateFiles(root, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("unexpected migrated count: %d", count)
+	}
+	for _, name := range []string{scanReportName, settingsName, deploymentManifestName} {
+		if _, err := os.Stat(filepath.Join(root, name)); !os.IsNotExist(err) {
+			t.Fatalf("top-level JSON remains: %s", name)
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, name)); err != nil {
+			t.Fatalf("migrated JSON missing: %s: %v", name, err)
+		}
+	}
+}
+
+func TestMigrateRootStateFilesPreservesConflict(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, stateDirectoryName)
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, settingsName)
+	destination := filepath.Join(stateDir, settingsName)
+	if err := os.WriteFile(source, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := migrateRootStateFiles(root, stateDir); err == nil {
+		t.Fatal("conflicting JSON should be reported")
+	}
+	if data, _ := os.ReadFile(source); string(data) != "old" {
+		t.Fatal("conflicting top-level JSON was overwritten")
+	}
+	if data, _ := os.ReadFile(destination); string(data) != "new" {
+		t.Fatal("data JSON was overwritten")
 	}
 }

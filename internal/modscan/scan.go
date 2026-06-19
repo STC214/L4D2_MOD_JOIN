@@ -37,14 +37,21 @@ type ConflictGroup struct {
 	AutoResolved bool
 }
 
+type InferredPackage struct {
+	Name     string
+	Category string
+	Reason   string
+}
+
 type Result struct {
-	Directory       string
-	Packages        []vpkmerge.PackageInfo
-	Categories      []Category
-	Conflicts       []Conflict
-	ConflictGroups  []ConflictGroup
-	UnknownPackages []string
-	Fingerprint     string
+	Directory        string
+	Packages         []vpkmerge.PackageInfo
+	Categories       []Category
+	Conflicts        []Conflict
+	ConflictGroups   []ConflictGroup
+	UnknownPackages  []string
+	InferredPackages []InferredPackage
+	Fingerprint      string
 }
 
 type ownerEntry struct {
@@ -120,6 +127,14 @@ func Scan(directory string) (Result, error) {
 	if len(result.Packages) == 0 {
 		return Result{}, fmt.Errorf("目录中没有未合并的源 MOD")
 	}
+	result.InferredPackages = refineMaterialCompanions(result.Packages, packageCategory)
+	result.UnknownPackages = result.UnknownPackages[:0]
+	for _, info := range result.Packages {
+		name := filepath.Base(info.Path)
+		if packageCategory[name] == "misc" {
+			result.UnknownPackages = append(result.UnknownPackages, name)
+		}
+	}
 	for path, entries := range owners {
 		if len(entries) < 2 {
 			continue
@@ -155,6 +170,92 @@ func Scan(directory string) (Result, error) {
 	result.ConflictGroups = buildConflictGroups(&result)
 	result.Fingerprint = fingerprint(result.Packages)
 	return result, nil
+}
+
+func refineMaterialCompanions(packages []vpkmerge.PackageInfo, categories map[string]string) []InferredPackage {
+	namespaceCategories := map[string]map[string]bool{}
+	for _, info := range packages {
+		name := filepath.Base(info.Path)
+		category := categories[name]
+		if category == "misc" {
+			continue
+		}
+		for namespace := range materialNamespaces(info) {
+			if namespaceCategories[namespace] == nil {
+				namespaceCategories[namespace] = map[string]bool{}
+			}
+			namespaceCategories[namespace][category] = true
+		}
+	}
+	var inferred []InferredPackage
+	for _, info := range packages {
+		name := filepath.Base(info.Path)
+		if categories[name] != "misc" || !isMaterialOnlyPackage(info) {
+			continue
+		}
+		candidates := map[string]bool{}
+		var matched []string
+		for namespace := range materialNamespaces(info) {
+			if isGenericMaterialNamespace(namespace) {
+				continue
+			}
+			for category := range namespaceCategories[namespace] {
+				candidates[category] = true
+				matched = append(matched, namespace)
+			}
+		}
+		if len(candidates) != 1 {
+			continue
+		}
+		category := ""
+		for candidate := range candidates {
+			category = candidate
+		}
+		sort.Strings(matched)
+		categories[name] = category
+		inferred = append(inferred, InferredPackage{
+			Name: name, Category: category,
+			Reason: "纯材质配套包与已识别 MOD 共享命名空间 materials/" + matched[0],
+		})
+	}
+	sort.Slice(inferred, func(i, j int) bool { return inferred[i].Name < inferred[j].Name })
+	return inferred
+}
+
+func isMaterialOnlyPackage(info vpkmerge.PackageInfo) bool {
+	runtimeFiles := 0
+	for _, file := range info.Files {
+		if isMetadata(file.Path) || strings.HasPrefix(file.Path, "source files/") {
+			continue
+		}
+		runtimeFiles++
+		if !strings.HasPrefix(file.Path, "materials/") {
+			return false
+		}
+	}
+	return runtimeFiles > 0
+}
+
+func materialNamespaces(info vpkmerge.PackageInfo) map[string]bool {
+	namespaces := map[string]bool{}
+	for _, file := range info.Files {
+		if !strings.HasPrefix(file.Path, "materials/") {
+			continue
+		}
+		parts := strings.Split(file.Path, "/")
+		if len(parts) >= 3 && parts[1] != "" {
+			namespaces[parts[1]] = true
+		}
+	}
+	return namespaces
+}
+
+func isGenericMaterialNamespace(namespace string) bool {
+	switch namespace {
+	case "models", "vgui", "effects", "sprites", "particle", "decals", "console", "hud", "overlays":
+		return true
+	}
+	return len(namespace) < 4
 }
 
 func (result Result) Plan(output string, selections map[string]string) (vpkmerge.Plan, error) {

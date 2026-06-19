@@ -17,10 +17,73 @@ import (
 )
 
 const (
+	stateDirectoryName = "data"
 	scanReportName     = "mod-scan-report.json"
 	conflictPolicyName = "mod-conflict-policy.json"
 	buildManifestName  = "l4d2modjoin-build.json"
+	settingsName       = "l4d2modjoin-settings.json"
 )
+
+func migrateRootStateFiles(rootDir, stateDir string) (int, error) {
+	if cleanPath(rootDir) == cleanPath(stateDir) {
+		return 0, nil
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return 0, fmt.Errorf("创建 JSON 状态目录失败: %w", err)
+	}
+	names := []string{
+		scanReportName,
+		conflictPolicyName,
+		buildManifestName,
+		deploymentManifestName,
+		settingsName,
+	}
+	migrated := 0
+	var failures []string
+	for _, name := range names {
+		source := filepath.Join(rootDir, name)
+		destination := filepath.Join(stateDir, name)
+		sourceData, err := os.ReadFile(source)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("读取 %s: %v", source, err))
+			continue
+		}
+		if destinationData, destinationErr := os.ReadFile(destination); destinationErr == nil {
+			if string(sourceData) != string(destinationData) {
+				failures = append(failures, fmt.Sprintf("%s 与 data 中同名文件内容不同，已保留旧文件", source))
+				continue
+			}
+			if err := os.Remove(source); err != nil {
+				failures = append(failures, fmt.Sprintf("清理旧文件 %s: %v", source, err))
+				continue
+			}
+			migrated++
+			continue
+		} else if !os.IsNotExist(destinationErr) {
+			failures = append(failures, fmt.Sprintf("读取 %s: %v", destination, destinationErr))
+			continue
+		}
+		if err := os.Rename(source, destination); err != nil {
+			failures = append(failures, fmt.Sprintf("迁移 %s: %v", source, err))
+			continue
+		}
+		migrated++
+	}
+	if len(failures) > 0 {
+		return migrated, fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return migrated, nil
+}
+
+type appSettings struct {
+	Version int    `json:"version"`
+	Source  string `json:"source"`
+	Output  string `json:"output"`
+	Addons  string `json:"addons"`
+}
 
 type conflictChoice struct {
 	Path      string   `json:"path"`
@@ -56,6 +119,36 @@ type buildManifest struct {
 	Packages       []string        `json:"packages"`
 	SourcePackages []sourcePackage `json:"source_packages"`
 	DeployedAddons string          `json:"deployed_addons,omitempty"`
+}
+
+func loadAppSettings(stateDir string) (appSettings, error) {
+	path := filepath.Join(stateDir, settingsName)
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return appSettings{Version: 1}, nil
+	}
+	if err != nil {
+		return appSettings{}, fmt.Errorf("读取目录设置失败: %w", err)
+	}
+	var settings appSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return appSettings{}, fmt.Errorf("目录设置格式错误: %w", err)
+	}
+	if settings.Version != 1 {
+		return appSettings{}, fmt.Errorf("不支持的目录设置版本: %d", settings.Version)
+	}
+	settings.Source = strings.TrimSpace(settings.Source)
+	settings.Output = strings.TrimSpace(settings.Output)
+	settings.Addons = strings.TrimSpace(settings.Addons)
+	return settings, nil
+}
+
+func saveAppSettings(stateDir string, settings appSettings) error {
+	settings.Version = 1
+	settings.Source = strings.TrimSpace(settings.Source)
+	settings.Output = strings.TrimSpace(settings.Output)
+	settings.Addons = strings.TrimSpace(settings.Addons)
+	return writeJSONAtomic(filepath.Join(stateDir, settingsName), settings)
 }
 
 func writeConflictPolicy(output string, result modscan.Result) error {
@@ -480,4 +573,42 @@ func pathWithin(path, parent string) bool {
 		return false
 	}
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+func subscriptionChanges(result modscan.Result, deployment buildManifest) (added, removed []string) {
+	current := map[string]bool{}
+	for _, info := range result.Packages {
+		current[strings.ToLower(filepath.Base(info.Path))] = true
+	}
+	previous := map[string]bool{}
+	for _, source := range deployment.SourcePackages {
+		previous[strings.ToLower(source.Name)] = true
+	}
+	if len(previous) == 0 {
+		for _, name := range deployment.Packages {
+			previous[strings.ToLower(filepath.Base(name))] = true
+		}
+	}
+	for _, info := range result.Packages {
+		name := filepath.Base(info.Path)
+		if !previous[strings.ToLower(name)] {
+			added = append(added, name)
+		}
+	}
+	for _, source := range deployment.SourcePackages {
+		if !current[strings.ToLower(source.Name)] {
+			removed = append(removed, source.Name)
+		}
+	}
+	if len(deployment.SourcePackages) == 0 {
+		for _, name := range deployment.Packages {
+			base := filepath.Base(name)
+			if !current[strings.ToLower(base)] {
+				removed = append(removed, base)
+			}
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
 }
